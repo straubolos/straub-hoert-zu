@@ -1,6 +1,6 @@
 // Service Worker: App-Dateien offline verfügbar machen.
 // Bei jeder Veröffentlichung VERSION erhöhen, damit Geräte die neue Fassung laden.
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const CACHE = `shz-${VERSION}`;
 const ASSETS = [
   './',
@@ -10,11 +10,16 @@ const ASSETS = [
   './js/app.js',
   './js/audio.js',
   './js/db.js',
+  './js/deepgram.js',
+  './js/deepseek.js',
   './js/export.js',
+  './js/http.js',
   './js/icons.js',
   './js/openai.js',
   './js/pipeline.js',
   './js/recorder.js',
+  './js/settings.js',
+  './js/summary.js',
   './js/util.js',
   './icons/icon.svg',
   './icons/favicon.ico',

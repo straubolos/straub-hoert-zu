@@ -766,3 +766,57 @@ body.has-recbar #toast { bottom: calc(var(--tabbar-h) + var(--sab) + 72px); }
 @media (min-width: 700px) {
   .tabbar { gap: 120px; }
 }
+
+/* ---------------------------------------------------------- Mehrere Dienste */
+
+.field-hint { display: block; margin: 6px 2px 0; color: var(--text-3); font-size: 13px; line-height: 1.4; }
+.setup-more { margin: 4px 0 6px; }
+.setup-more summary {
+  padding: 8px 2px;
+  color: var(--text-2);
+  font-size: 14.5px;
+  font-weight: 500;
+  list-style: none;
+  cursor: pointer;
+}
+.setup-more summary::-webkit-details-marker { display: none; }
+.setup-more summary::before { content: "+ "; color: var(--text-3); }
+.setup-more[open] summary::before { content: "– "; }
+.setup-more[open] summary { margin-bottom: 6px; }
+
+.key-row { padding: 4px 0 14px; border-bottom: 0.5px solid var(--line); }
+.key-row + .key-row { padding-top: 14px; }
+.key-row:last-of-type { border-bottom: 0; }
+.key-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.key-head strong { font-size: 16.5px; font-weight: 600; }
+.key-head .mono { font-size: 13px; }
+.key-extra { margin-top: 4px; }
+.btn-row.compact { margin-top: 10px; gap: 8px; }
+.btn-row.compact .btn { flex: 0 1 auto; min-width: 0; }
+
+.choices { padding: 6px 18px; }
+.choice {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 60px;
+  padding: 10px 0;
+  border-bottom: 0.5px solid var(--line);
+  cursor: pointer;
+}
+.choice:last-of-type { border-bottom: 0; }
+.choice input { position: absolute; opacity: 0; pointer-events: none; }
+.choice-dot {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: 1.5px solid var(--text-3);
+  border-radius: 50%;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.choice input:checked + .choice-dot { border-color: var(--text); box-shadow: inset 0 0 0 5px var(--surface), inset 0 0 0 11px var(--text); }
+.choice-text strong { display: block; font-weight: 600; }
+.choice-text small { display: block; margin-top: 2px; color: var(--text-2); font-size: 13.5px; }
+.choice.is-disabled { opacity: 0.45; cursor: default; }
+.toggle-row.sub { padding: 14px 0 8px; border-top: 0.5px solid var(--line); }
+.choices > p { margin: 4px 0 10px; }

@@ -1,10 +1,20 @@
-// Verarbeitung nach der Aufnahme: Teile transkribieren (mit Sprechererkennung),
-// Sprecher über Teile hinweg vereinheitlichen, zusammensetzen, Titel + Zusammenfassung.
-// Fortschritt wird pro Teil gespeichert – ein Neustart macht nur Fehlendes neu.
+// Verarbeitung nach der Aufnahme: Teile transkribieren, Sprecher vereinheitlichen,
+// zusammensetzen, dann Titel + Zusammenfassung. Fortschritt wird pro Teil gespeichert –
+// ein Neustart macht nur Fehlendes neu.
+//
+// Transkription je nach Einstellung:
+// - Deepgram: ganze Datei, Sprechererkennung inklusive.
+// - OpenAI: 10-Minuten-Teile, Sprecher über Stimmproben teilübergreifend gleich.
+// - DeepSeek: Teil wird dekodiert und an Sprechpausen in ≤ 110-s-WAV-Stücke zerlegt
+//   (DeepSeek-Limit 120 s), ohne Sprecher.
 
 import * as db from './db.js';
-import * as api from './openai.js';
-import { decodeAudio, clipToWavDataUrl } from './audio.js';
+import * as openai from './openai.js';
+import * as deepseek from './deepseek.js';
+import * as deepgram from './deepgram.js';
+import { ApiError, withRetry, pool } from './http.js';
+import { getSettings, TRANSCRIBERS } from './settings.js';
+import { decodeToMono16k, clipToWavDataUrl, splitAtPauses, wavBlob, RATE } from './audio.js';
 import { extForMime } from './recorder.js';
 import { fmtStamp, speakerName } from './util.js';
 
@@ -64,12 +74,14 @@ const KNOWN_PREFIX = 'SPK_';
 async function processRecording(id) {
   let rec = await db.getRecording(id);
   if (!rec) return;
-  const settings = api.getSettings();
+  const settings = getSettings();
   const n = rec.parts.length;
   let stage = 'transcribe';
 
   try {
-    if (!api.getKey()) throw new api.ApiError('Kein API-Schlüssel hinterlegt.', { status: 0 });
+    if (!settings.transcriber) {
+      throw new ApiError('Kein Dienst für die Transkription eingerichtet. Bitte in den Einstellungen einen API-Schlüssel hinterlegen.', { status: 0 });
+    }
     rec = await db.updateRecording(id, (r) => { r.status = 'transcribing'; r.error = null; });
     emitChange(id);
 
@@ -77,13 +89,15 @@ async function processRecording(id) {
     const speakerTime = { ...(rec.speakerTime || {}) };
     const refs = { ...(rec.speakerRefs || {}) };
     const parts = rec.transcriptParts || {};
-    const failedModes = new Set(); // in diesem Durchlauf nicht nutzbare Modelle überspringen
+    const failedModes = new Set(); // OpenAI: in diesem Durchlauf nicht nutzbare Modelle überspringen
 
     for (let i = 0; i < n; i++) {
       if (parts[i]) continue;
       const part = rec.parts[i];
-      const label = n > 1 ? `Teil ${i + 1} von ${n} wird transkribiert …` : 'Wird transkribiert …';
-      emitProgress(id, label, i / n * 0.9);
+      const prefix = n > 1 ? `Teil ${i + 1} von ${n}` : '';
+      const label = prefix ? `${prefix} wird transkribiert …` : 'Wird transkribiert …';
+      const report = (text, within = 0) => emitProgress(id, text, (i + within) / n * 0.9);
+      report(label);
 
       const blob = await db.getPartBlob(id, i, part?.mime);
       if (!part || blob.size < 1000) {
@@ -91,27 +105,36 @@ async function processRecording(id) {
         await db.updateRecording(id, (r) => { r.transcriptParts = { ...r.transcriptParts, [i]: parts[i] }; });
         continue;
       }
-      if (blob.size > api.MAX_UPLOAD_BYTES) {
-        throw new Error(`Teil ${i + 1} ist mit ${(blob.size / 1048576).toFixed(1)} MB größer als das OpenAI-Limit von 25 MB.`);
-      }
 
       const onRetry = (info) => {
-        if (info.offline) emitProgress(id, 'Warte auf Internetverbindung …', i / n * 0.9);
-        else emitProgress(id, `${label.replace(' …', '')} – neuer Versuch ${info.attempt} von ${info.attempts} …`, i / n * 0.9);
+        if (info.offline) report('Warte auf Internetverbindung …');
+        else report(`${label.replace(' …', '')} – neuer Versuch ${info.attempt} von ${info.attempts} …`);
       };
 
-      const result = await transcribePart({
-        blob, index: i, mime: part.mime, settings, refs, speakers, speakerTime, onRetry, failedModes,
-      });
+      let result;
+      if (settings.transcriber === 'deepgram') {
+        result = await transcribeDeepgram({ blob, settings, onRetry, firstPart: speakers.length === 0 });
+      } else if (settings.transcriber === 'deepseek') {
+        result = await transcribeDeepSeek({ blob, prefix, report });
+      } else {
+        if (blob.size > openai.MAX_UPLOAD_BYTES) {
+          throw new Error(`Teil ${i + 1} ist mit ${(blob.size / 1048576).toFixed(1)} MB größer als das OpenAI-Limit von 25 MB.`);
+        }
+        result = await transcribeOpenAI({
+          blob, index: i, mime: part.mime, settings, refs, speakers, speakerTime, onRetry, failedModes,
+        });
+      }
 
       // Sprecher den einheitlichen Buchstaben zuordnen.
       const local = new Map();
       for (const s of result.segments) {
-        if (!s.speakerRaw) { s.speaker = null; continue; }
+        if (!s.speakerRaw) { s.speaker = null; delete s.speakerRaw; continue; }
         const raw = String(s.speakerRaw);
         let g = raw.startsWith(KNOWN_PREFIX) ? raw.slice(KNOWN_PREFIX.length) : local.get(raw);
         if (!g) {
-          g = letterFor(speakers.length);
+          let k = 0;
+          while (speakers.includes(letterFor(k)) || [...local.values()].includes(letterFor(k))) k++;
+          g = letterFor(k);
           local.set(raw, g);
         }
         if (!speakers.includes(g)) speakers.push(g);
@@ -119,20 +142,22 @@ async function processRecording(id) {
         speakerTime[g] = (speakerTime[g] || 0) + Math.max(0, (s.end || 0) - (s.start || 0));
         delete s.speakerRaw;
       }
+      speakers.sort();
 
       parts[i] = {
+        provider: settings.transcriber,
         model: result.model,
         diarized: result.diarized,
         duration: result.duration ?? (part.duration || 0) / 1000,
         segments: result.segments,
       };
 
-      // Referenzclips für Sprecher ohne Referenz – nur nötig, wenn weitere Teile folgen.
-      if (result.diarized && i < n - 1) {
+      // OpenAI: Stimmproben für Sprecher ohne Probe – nur nötig, wenn weitere Teile folgen.
+      if (result.diarized && settings.transcriber === 'openai' && i < n - 1) {
         const missing = speakers.filter((g) => !refs[g]);
         if (missing.length) {
-          emitProgress(id, `${label.replace(' wird transkribiert …', '')}: Stimmen werden abgeglichen …`, (i + 0.95) / n * 0.9);
-          await extractRefs(blob, result.segments, missing, refs).catch((e) => console.warn('Referenzclips:', e));
+          report(`${prefix || 'Aufnahme'}: Stimmen werden abgeglichen …`, 0.95);
+          await extractRefs(blob, result.segments, missing, refs).catch((e) => console.warn('Stimmproben:', e));
         }
       }
 
@@ -166,14 +191,23 @@ async function processRecording(id) {
       });
       return;
     }
+    if (!settings.summarizer) {
+      // Ohne Dienst für Zusammenfassungen: Titel aus den ersten Worten.
+      await db.updateRecording(id, (r) => {
+        r.status = 'done';
+        if (!r.titleManual) r.title = fallbackTitle(r.segments);
+        r.speakerRefs = {};
+      });
+      return;
+    }
     rec = await db.updateRecording(id, (r) => { r.status = 'summarizing'; });
     emitChange(id);
     emitProgress(id, 'Titel und Zusammenfassung werden erstellt …', 0.94);
-    const sum = await api.summarize(text, {
-      model: settings.summaryModel,
-      onRetry: (info) => emitProgress(id, info.offline ? 'Warte auf Internetverbindung …'
-        : `Zusammenfassung – neuer Versuch ${info.attempt} von ${info.attempts} …`, 0.94),
-    });
+    const onRetry = (info) => emitProgress(id, info.offline ? 'Warte auf Internetverbindung …'
+      : `Zusammenfassung – neuer Versuch ${info.attempt} von ${info.attempts} …`, 0.94);
+    const sum = settings.summarizer === 'deepseek'
+      ? await deepseek.summarize(text, { model: settings.deepseekModel, onRetry })
+      : await openai.summarize(text, { model: settings.summaryModel, onRetry });
     await db.updateRecording(id, (r) => {
       r.summary = sum.summary;
       r.summaryModel = sum.model;
@@ -191,8 +225,74 @@ async function processRecording(id) {
   }
 }
 
+function fallbackTitle(segments) {
+  const words = (segments || []).map((s) => s.text).join(' ').replace(/[^\p{L}\p{N}\s-]/gu, ' ').split(/\s+/).filter(Boolean);
+  return words.slice(0, 5).join(' ') || 'Aufnahme';
+}
+
+// ---------- Deepgram ----------
+
+async function transcribeDeepgram({ blob, settings, onRetry, firstPart }) {
+  const data = await withRetry(() => deepgram.transcribe(blob, { model: settings.deepgramModel }), { onRetry });
+  // Deepgram nummeriert Sprecher je Datei ab 0. Im ersten Teil nach erstem Auftreten
+  // (wer zuerst spricht, ist A), in Folgeteilen feste Zuordnung 0 → A, 1 → B, …
+  const order = [];
+  const raw = deepgram.toSegments(data);
+  for (const s of raw) if (s.speakerRaw && !order.includes(s.speakerRaw)) order.push(s.speakerRaw);
+  const segments = raw.map((s) => ({
+    ...s,
+    speakerRaw: s.speakerRaw
+      ? KNOWN_PREFIX + letterFor(firstPart ? order.indexOf(s.speakerRaw) : (Number(s.speakerRaw.slice(2)) || 0))
+      : null,
+  }));
+  const dur = Number(data?.metadata?.duration);
+  return {
+    model: data?.metadata?.model_info ? Object.values(data.metadata.model_info)[0]?.name || settings.deepgramModel : settings.deepgramModel,
+    diarized: segments.some((s) => s.speakerRaw),
+    duration: Number.isFinite(dur) && dur > 0 ? dur : null,
+    segments,
+  };
+}
+
+// ---------- DeepSeek ----------
+
+async function transcribeDeepSeek({ blob, prefix, report }) {
+  let audio;
+  try {
+    audio = await decodeToMono16k(blob);
+  } catch (e) {
+    throw new Error(`Audio konnte für DeepSeek nicht umgewandelt werden (${e?.message || e}).`);
+  }
+  const cuts = splitAtPauses(audio.samples, { maxSec: 110, minSec: 75 });
+  const pieces = [];
+  for (let k = 0; k < cuts.length - 1; k++) pieces.push({ from: cuts[k], to: cuts[k + 1] });
+  let done = 0;
+  const label = (x) => `${prefix ? `${prefix}: ` : ''}Abschnitt ${x} von ${pieces.length} wird transkribiert …`;
+  report(label(1));
+  const texts = await pool(pieces, 3, async (p, k) => {
+    const wav = wavBlob(audio.samples, p.from, p.to);
+    const res = await withRetry(() => deepseek.asr(wav), {
+      onRetry: (info) => report(info.offline ? 'Warte auf Internetverbindung …'
+        : `${label(k + 1).replace(' …', '')} – neuer Versuch ${info.attempt} von ${info.attempts} …`, done / pieces.length),
+    });
+    done++;
+    report(label(Math.min(done + 1, pieces.length)), done / pieces.length);
+    return res.text;
+  });
+  return {
+    model: 'deepseek-asr',
+    diarized: false,
+    duration: audio.duration,
+    segments: pieces
+      .map((p, k) => ({ start: p.from / RATE, end: p.to / RATE, speakerRaw: null, text: texts[k] }))
+      .filter((s) => s.text),
+  };
+}
+
+// ---------- OpenAI ----------
+
 /** Transkribiert einen Teil. Fällt bei Modellproblemen auf Modelle ohne Sprecher zurück. */
-async function transcribePart({ blob, index, mime, settings, refs, speakers, speakerTime, onRetry, failedModes }) {
+async function transcribeOpenAI({ blob, index, mime, settings, refs, speakers, speakerTime, onRetry, failedModes }) {
   const filename = `teil-${index + 1}.${extForMime(mime)}`;
   const steps = [];
   if (settings.diarize) steps.push({ mode: 'diarize', model: settings.diarizeModel });
@@ -212,15 +312,15 @@ async function transcribePart({ blob, index, mime, settings, refs, speakers, spe
   for (let s = 0; s < list.length; s++) {
     const step = list[s];
     try {
-      const raw = await api.withRetry(() => api.transcribe({
+      const raw = await withRetry(() => openai.transcribe({
         blob, filename, model: step.model, mode: step.mode,
         knownSpeakers: step.mode === 'diarize' ? known : [],
       }), { onRetry });
-      return normalize(raw, step);
+      return normalizeOpenAI(raw, step);
     } catch (e) {
       lastErr = e;
       const isLast = s === list.length - 1;
-      const modelProblem = e instanceof api.ApiError && (e.opaque || [400, 403, 404, 422].includes(e.status));
+      const modelProblem = e instanceof ApiError && (e.opaque || [400, 403, 404, 422].includes(e.status));
       if (!modelProblem || isLast) throw e;
       failedModes.add(step.mode);
       console.warn(`Modell ${step.model} nicht nutzbar, versuche nächstes`, e);
@@ -229,7 +329,7 @@ async function transcribePart({ blob, index, mime, settings, refs, speakers, spe
   throw lastErr;
 }
 
-function normalize(raw, step) {
+function normalizeOpenAI(raw, step) {
   const data = typeof raw === 'string' ? { text: raw } : (raw || {});
   if (step.mode === 'diarize' && Array.isArray(data.segments)) {
     return {
@@ -265,7 +365,7 @@ function normalize(raw, step) {
 }
 
 async function extractRefs(blob, segments, missing, refs) {
-  const audio = await decodeAudio(blob);
+  const audio = await decodeToMono16k(blob);
   for (const g of missing) {
     const best = segments
       .filter((s) => s.speaker === g && s.end - s.start >= 2.5)
@@ -274,9 +374,11 @@ async function extractRefs(blob, segments, missing, refs) {
     const start = best.start + 0.2;
     const end = Math.min(best.end - 0.2, start + 8);
     if (end - start < 2.1) continue;
-    refs[g] = clipToWavDataUrl(audio, start, end);
+    refs[g] = clipToWavDataUrl(audio.samples, start, end);
   }
 }
+
+// ---------- Zusammensetzen ----------
 
 function mergeParts(recParts, parts) {
   const out = [];
@@ -321,16 +423,23 @@ export function transcriptForModel(rec) {
   }).join('\n');
 }
 
+/** Ob der gewählte Transkriptionsdienst Sprecher erkennt (für Hinweise in der Oberfläche). */
+export function transcriberHasSpeakers() {
+  const t = getSettings().transcriber;
+  return !!(t && TRANSCRIBERS[t]?.speakers);
+}
+
 /** Beim App-Start: abgebrochene Aufnahmen markieren, offene Verarbeitungen fortsetzen. */
 export async function recoverOnStartup() {
   const all = await db.getAllRecordings();
+  const canWork = !!getSettings().transcriber;
   for (const r of all) {
     if (r.status === 'recording') {
       await db.updateRecording(r.id, (x) => {
         x.status = 'interrupted';
         x.duration = x.parts.reduce((s, p) => s + (p?.duration || 0), 0);
       });
-    } else if (['queued', 'transcribing', 'summarizing'].includes(r.status) && api.getKey()) {
+    } else if (['queued', 'transcribing', 'summarizing'].includes(r.status) && canWork) {
       enqueue(r.id);
     }
   }

@@ -1,7 +1,13 @@
 // Straub hört zu – Oberfläche, Navigation und Ablauf.
 
 import * as db from './db.js';
-import * as api from './openai.js';
+import * as openai from './openai.js';
+import * as deepseek from './deepseek.js';
+import * as deepgram from './deepgram.js';
+import {
+  PROVIDERS, TRANSCRIBERS, SUMMARIZERS, DEFAULT_SETTINGS, getKey, setKey, clearKey, hasAnyKey, maskKey,
+  getSettings, saveSettings, partLimits,
+} from './settings.js';
 import * as pipeline from './pipeline.js';
 import { Recorder, isRecordingSupported } from './recorder.js';
 import {
@@ -13,7 +19,7 @@ import {
   normalizeSearch, speakerName, fmtBytes, isStandalone, isIOS,
 } from './util.js';
 
-export const APP_VERSION = '1.0.0';
+export const APP_VERSION = '1.1.0';
 
 const recorder = new Recorder();
 const state = {
@@ -135,7 +141,7 @@ function route() {
   cleanupPage();
   const hash = location.hash || '#/';
 
-  if (!api.getKey()) {
+  if (!hasAnyKey()) {
     showView('page', null);
     renderSetup();
     return;
@@ -162,7 +168,7 @@ function showView(which, tab) {
   viewRecord.hidden = which !== 'record';
   viewPage.hidden = which !== 'page';
   if (which === 'page') window.scrollTo(0, 0);
-  tabbar.hidden = !api.getKey();
+  tabbar.hidden = !hasAnyKey();
   for (const a of tabbar.querySelectorAll('a')) a.classList.toggle('active', a.dataset.tab === tab);
   updateRecbar();
 }
@@ -191,7 +197,7 @@ async function onRecClick() {
     }
     waveHistory.length = 0;
     try {
-      await recorder.start();
+      await startRecording();
     } catch (e) {
       alertDialog('Aufnahme nicht möglich', e.message);
     }
@@ -208,6 +214,14 @@ async function onRecClick() {
       renderRecState();
     }
   }
+}
+
+/** Startet die Aufnahme mit der zum Transkriptionsdienst passenden Teillänge. */
+function startRecording(opts = {}) {
+  const limits = partLimits(getSettings().transcriber);
+  recorder.partMaxMs = limits.partMaxMs;
+  recorder.partMaxBytes = limits.partMaxBytes;
+  return recorder.start(opts);
 }
 
 async function onPauseClick() {
@@ -438,7 +452,7 @@ async function onNoticeClick(e) {
   } else if (btn.dataset.act === 'continue') {
     waveHistory.length = 0;
     try {
-      await recorder.start({ continueId: id });
+      await startRecording({ continueId: id });
       renderNotices();
     } catch (err) {
       alertDialog('Aufnahme nicht möglich', err.message);
@@ -772,7 +786,7 @@ async function onPageClick(e) {
     case 'continue': {
       try {
         waveHistory.length = 0;
-        await recorder.start({ continueId: rec.id });
+        await startRecording({ continueId: rec.id });
         go('#/');
       } catch (err) {
         alertDialog('Aufnahme nicht möglich', err.message);
@@ -782,14 +796,16 @@ async function onPageClick(e) {
     case 'finish': return finishInterrupted(rec.id);
 
     // ----- Einstellungen -----
-    case 'key-change': return changeKey();
-    case 'key-test': return testStoredKey(btn);
-    case 'key-delete': return deleteKey();
+    case 'key-change': return changeKey(btn.dataset.provider);
+    case 'key-test': return testStoredKey(btn.dataset.provider, btn);
+    case 'key-delete': return deleteKey(btn.dataset.provider);
     case 'models-reset': {
-      api.saveSettings({
-        diarizeModel: api.DEFAULT_SETTINGS.diarizeModel,
-        transcribeModel: api.DEFAULT_SETTINGS.transcribeModel,
-        summaryModel: api.DEFAULT_SETTINGS.summaryModel,
+      saveSettings({
+        diarizeModel: DEFAULT_SETTINGS.diarizeModel,
+        transcribeModel: DEFAULT_SETTINGS.transcribeModel,
+        summaryModel: DEFAULT_SETTINGS.summaryModel,
+        deepseekModel: DEFAULT_SETTINGS.deepseekModel,
+        deepgramModel: DEFAULT_SETTINGS.deepgramModel,
       });
       toast('Standardmodelle wiederhergestellt');
       return renderSettings();
@@ -989,7 +1005,7 @@ async function updateProcessingLock() {
 }
 
 async function retryNetworkErrors() {
-  if (!api.getKey() || navigator.onLine === false) return;
+  if (!hasAnyKey() || navigator.onLine === false) return;
   const recs = await db.getAllRecordings();
   for (const r of recs) {
     if (r.status === 'error' && r.error?.network && !pipeline.isBusy(r.id)) pipeline.enqueue(r.id);
@@ -1000,6 +1016,19 @@ async function retryNetworkErrors() {
 // Einrichtung & Einstellungen
 // =====================================================================
 
+const KEY_TESTERS = { deepseek: deepseek.testKey, deepgram: deepgram.testKey, openai: openai.testKey };
+
+function keyField(provider, { label, hint }) {
+  const p = PROVIDERS[provider];
+  return `
+    <label class="field">
+      <span>${esc(label)}</span>
+      <input name="${provider}" class="secret" type="text" autocomplete="off" autocapitalize="off"
+        autocorrect="off" spellcheck="false" placeholder="${esc(p.keyHint)}">
+      ${hint ? `<small class="field-hint">${hint}</small>` : ''}
+    </label>`;
+}
+
 function renderSetup() {
   tabbar.hidden = true;
   viewPage.innerHTML = `
@@ -1008,87 +1037,134 @@ function renderSetup() {
       <h1>Straub hört zu</h1>
       <p class="muted">Gespräche aufnehmen, transkribieren und zusammenfassen.</p>
       <form id="setup-form" class="card setup-card" autocomplete="off">
-        <label class="field">
-          <span>OpenAI-API-Schlüssel</span>
-          <input id="setup-key" class="secret" type="text" inputmode="text" autocomplete="off" autocapitalize="off"
-            autocorrect="off" spellcheck="false" placeholder="sk-…" required>
-        </label>
-        <p class="hint-line">${icons.lock}<span>Wird nur auf diesem Gerät gespeichert und nur an OpenAI gesendet.</span></p>
+        ${keyField('deepseek', { label: 'DeepSeek-API-Schlüssel', hint: 'Für Titel, Zusammenfassung und Transkription (ohne Sprecher).' })}
+        ${keyField('deepgram', { label: 'Deepgram-API-Schlüssel (optional)', hint: 'Für Sprechererkennung. Deepgram bietet Startguthaben ohne Kreditkarte.' })}
+        <details class="setup-more">
+          <summary>OpenAI (optional)</summary>
+          ${keyField('openai', { label: 'OpenAI-API-Schlüssel', hint: '' })}
+        </details>
+        <p class="hint-line">${icons.lock}<span>Schlüssel werden nur auf diesem Gerät gespeichert und nur an den jeweiligen Dienst gesendet.</span></p>
         <button class="btn btn-primary btn-lg" type="submit">Speichern</button>
         <p class="form-msg" id="setup-msg" role="alert"></p>
       </form>
-      <p class="muted small center">Einen Schlüssel erstellst du im OpenAI-Konto unter „API keys“ (platform.openai.com).</p>
+      <p class="muted small center">Schlüssel erstellen: platform.deepseek.com › API keys · console.deepgram.com › API Keys</p>
     </div>`;
   $('#setup-form').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const input = $('#setup-key');
-    const ok = await saveKeyFlow(input.value, $('#setup-msg'), e.submitter || $('#setup-form button'));
-    if (ok) {
-      input.value = '';
-      toast('Schlüssel gespeichert');
-      db.requestPersistence();
-      go('#/');
+    const form = e.target;
+    const values = Object.fromEntries(new FormData(form).entries());
+    const msg = $('#setup-msg');
+    const entered = Object.keys(PROVIDERS).filter((p) => String(values[p] || '').trim());
+    if (!entered.length) {
+      msg.textContent = 'Bitte mindestens einen Schlüssel eingeben (am besten DeepSeek).';
+      return;
     }
+    const button = form.querySelector('[type=submit]');
+    for (const p of entered) {
+      const ok = await saveKeyFlow(p, values[p], msg, button);
+      if (!ok) return;
+      form.elements[p].value = '';
+    }
+    toast(entered.length > 1 ? 'Schlüssel gespeichert' : `${PROVIDERS[entered[0]].name}-Schlüssel gespeichert`);
+    db.requestPersistence();
+    go('#/');
   });
 }
 
 /** Prüft und speichert einen Schlüssel. Gibt true zurück, wenn gespeichert. */
-async function saveKeyFlow(raw, msgEl, button) {
+async function saveKeyFlow(provider, raw, msgEl, button) {
+  const p = PROVIDERS[provider];
   const key = String(raw || '').trim();
   msgEl.textContent = '';
-  msgEl.className = 'form-msg';
   if (!key) { msgEl.textContent = 'Bitte einen Schlüssel eingeben.'; return false; }
-  if (!/^sk-[A-Za-z0-9_\-]{16,}$/.test(key)) {
-    msgEl.textContent = 'Das sieht nicht wie ein OpenAI-Schlüssel aus (beginnt mit „sk-“).';
+  if (!p.keyPattern.test(key)) {
+    msgEl.textContent = `Das sieht nicht wie ein ${p.name}-Schlüssel aus.`;
     return false;
   }
-  if (button) { button.disabled = true; button.dataset.label = button.textContent; button.textContent = 'Wird geprüft …'; }
-  const res = await api.testKey(key);
-  if (button) { button.disabled = false; button.textContent = button.dataset.label; }
-  if (res.ok) { api.setKey(key); return true; }
-  if (res.reason === 'invalid') { msgEl.textContent = 'OpenAI lehnt diesen Schlüssel ab. Bitte prüfen.'; return false; }
+  const label = button?.textContent;
+  if (button) { button.disabled = true; button.textContent = `${p.name} wird geprüft …`; }
+  const res = await KEY_TESTERS[provider](key);
+  if (button) { button.disabled = false; button.textContent = label; }
+  if (res.ok) { setKey(provider, key); return true; }
+  if (res.reason === 'invalid') { msgEl.textContent = `${p.name} lehnt diesen Schlüssel ab. Bitte prüfen.`; return false; }
   // Offline oder anderer Fehler: trotzdem speichern.
-  api.setKey(key);
-  toast(res.reason === 'network' ? 'Offline – Schlüssel ungeprüft gespeichert' : `Prüfung nicht möglich (${res.status}) – gespeichert`);
+  setKey(provider, key);
+  toast(res.reason === 'network' ? `Offline – ${p.name}-Schlüssel ungeprüft gespeichert` : `${p.name}: Prüfung nicht möglich (${res.status}) – gespeichert`);
   return true;
 }
 
+function choiceList(name, table, current) {
+  return Object.entries(table).map(([id, t]) => {
+    const has = !!getKey(t.provider);
+    return `
+      <label class="choice ${has ? '' : 'is-disabled'}">
+        <input type="radio" name="${name}" value="${id}" ${id === current ? 'checked' : ''} ${has ? '' : 'disabled'}>
+        <span class="choice-dot"></span>
+        <span class="choice-text"><strong>${esc(t.label)}</strong><small>${esc(t.detail)}${has ? '' : ' · Schlüssel fehlt'}</small></span>
+      </label>`;
+  }).join('');
+}
+
 async function renderSettings() {
-  const s = api.getSettings();
-  const key = api.getKey();
+  const s = getSettings();
   const recs = await db.getAllRecordings();
+  const keyRows = Object.entries(PROVIDERS).map(([id, p]) => {
+    const key = getKey(id);
+    return `
+      <div class="key-row">
+        <div class="key-head">
+          <strong>${esc(p.name)}</strong>
+          <span class="mono muted">${key ? esc(maskKey(key)) : 'nicht hinterlegt'}</span>
+        </div>
+        ${id === 'deepseek' && key ? '<div class="key-extra muted small" id="ds-balance">Guthaben wird abgefragt …</div>' : ''}
+        <div class="btn-row compact">
+          <button class="btn btn-small" data-act="key-change" data-provider="${id}">${icons.key}<span>${key ? 'Ändern' : 'Hinzufügen'}</span></button>
+          ${key ? `<button class="btn btn-small" data-act="key-test" data-provider="${id}">${icons.check}<span>Prüfen</span></button>
+          <button class="btn btn-small btn-quiet" data-act="key-delete" data-provider="${id}">${icons.trash}<span>Löschen</span></button>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+
   viewPage.innerHTML = `
     ${navBack('#/', 'Zurück')}
     <h1 class="page-title">Einstellungen</h1>
 
-    <h2 class="group-title">OpenAI-API-Schlüssel</h2>
+    <h2 class="group-title">API-Schlüssel</h2>
     <div class="card">
-      <div class="kv"><span>Status</span><span class="mono">${key ? `Gespeichert · ${esc(api.maskKey(key))}` : 'Nicht hinterlegt'}</span></div>
-      <p class="hint-line">${icons.lock}<span>Liegt nur auf diesem Gerät und wird ausschließlich an api.openai.com gesendet.</span></p>
-      <div class="btn-row">
-        <button class="btn" data-act="key-change">${icons.key}<span>Ändern</span></button>
-        <button class="btn" data-act="key-test">${icons.check}<span>Prüfen</span></button>
-        <button class="btn btn-quiet" data-act="key-delete">${icons.trash}<span>Löschen</span></button>
-      </div>
+      ${keyRows}
+      <p class="hint-line">${icons.lock}<span>Schlüssel liegen nur auf diesem Gerät und gehen nur an den jeweiligen Dienst.</span></p>
     </div>
 
     <h2 class="group-title">Transkription</h2>
-    <div class="card">
-      <label class="toggle-row">
-        <span><strong>Sprechererkennung</strong><small>Kennzeichnet Sprecher A, B, … einheitlich über die ganze Aufnahme.</small></span>
-        <input type="checkbox" class="switch" id="set-diarize" ${s.diarize ? 'checked' : ''}>
-      </label>
+    <div class="card choices" data-setting="transcriber">
+      ${choiceList('transcriber', TRANSCRIBERS, s.transcriber)}
+      ${s.transcriber === 'openai' ? `
+        <label class="toggle-row sub">
+          <span><strong>Sprechererkennung</strong><small>Bei OpenAI abschaltbar (dann gpt-transcribe).</small></span>
+          <input type="checkbox" class="switch" id="set-diarize" ${s.diarize ? 'checked' : ''}>
+        </label>` : ''}
     </div>
+
+    <h2 class="group-title">Titel und Zusammenfassung</h2>
+    <div class="card choices" data-setting="summarizer">
+      ${choiceList('summarizer', SUMMARIZERS, s.summarizer)}
+      ${s.summarizer ? '' : '<p class="muted small">Ohne Dienst wird nur transkribiert; der Titel entsteht aus den ersten Worten.</p>'}
+    </div>
+
     <details class="card adv">
       <summary>Modelle (erweitert)</summary>
-      <label class="field"><span>Transkription mit Sprechern</span>
+      <label class="field"><span>DeepSeek: Zusammenfassung</span>
+        <input id="set-deepseekModel" value="${esc(s.deepseekModel)}" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+      <label class="field"><span>Deepgram: Transkription</span>
+        <input id="set-deepgramModel" value="${esc(s.deepgramModel)}" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+      <label class="field"><span>OpenAI: Transkription mit Sprechern</span>
         <input id="set-diarizeModel" value="${esc(s.diarizeModel)}" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
-      <label class="field"><span>Transkription ohne Sprecher (Ersatz)</span>
+      <label class="field"><span>OpenAI: Transkription ohne Sprecher</span>
         <input id="set-transcribeModel" value="${esc(s.transcribeModel)}" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
-      <label class="field"><span>Titel und Zusammenfassung</span>
+      <label class="field"><span>OpenAI: Zusammenfassung</span>
         <input id="set-summaryModel" value="${esc(s.summaryModel)}" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
-      <p class="muted small">Ist ein Modell nicht verfügbar, nutzt die App automatisch einen Ersatz. Hinweis: OpenAI stellt
-        „gpt-4o-transcribe-diarize“ laut Doku am 26.02.2027 ein – danach wird ohne Sprecher transkribiert, bis hier ein Nachfolger eingetragen ist.</p>
+      <p class="muted small">Ist ein Modell nicht verfügbar, nutzt die App wenn möglich automatisch einen Ersatz.
+        Hinweis: OpenAI stellt „gpt-4o-transcribe-diarize“ laut Doku am 26.02.2027 ein.</p>
       <button class="btn btn-quiet" data-act="models-reset">${icons.refresh}<span>Standard wiederherstellen</span></button>
     </details>
 
@@ -1102,21 +1178,35 @@ async function renderSettings() {
     <h2 class="group-title">Über</h2>
     <div class="card">
       <div class="kv"><span>Version</span><span>${APP_VERSION}</span></div>
-      <p class="muted small">Alle Aufnahmen, Transkripte und der Schlüssel bleiben auf diesem iPhone.
-        Audio und Text werden nur zur Verarbeitung an OpenAI übertragen.</p>
+      <p class="muted small">Aufnahmen, Transkripte und Schlüssel bleiben auf diesem iPhone. Audio und Text gehen nur
+        zur Verarbeitung an die oben gewählten Dienste.</p>
     </div>`;
 
-  $('#set-diarize').addEventListener('change', (e) => {
-    api.saveSettings({ diarize: e.target.checked });
+  for (const box of viewPage.querySelectorAll('.choices')) {
+    box.addEventListener('change', (e) => {
+      if (e.target.type !== 'radio') return;
+      saveSettings({ [box.dataset.setting]: e.target.value });
+      toast(`${e.target.closest('.choice').querySelector('strong').textContent} gewählt`);
+      renderSettings();
+    });
+  }
+  $('#set-diarize')?.addEventListener('change', (e) => {
+    saveSettings({ diarize: e.target.checked });
     toast(e.target.checked ? 'Sprechererkennung an' : 'Sprechererkennung aus');
   });
-  for (const k of ['diarizeModel', 'transcribeModel', 'summaryModel']) {
+  for (const k of ['deepseekModel', 'deepgramModel', 'diarizeModel', 'transcribeModel', 'summaryModel']) {
     $(`#set-${k}`).addEventListener('change', (e) => {
-      api.saveSettings({ [k]: e.target.value.trim() || api.DEFAULT_SETTINGS[k] });
+      saveSettings({ [k]: e.target.value.trim() || DEFAULT_SETTINGS[k] });
       toast('Gespeichert');
     });
   }
 
+  if (getKey('deepseek')) {
+    deepseek.balance().then((b) => {
+      const el = $('#ds-balance');
+      if (el) el.textContent = b ? `Guthaben: ${b}` : 'Guthaben nicht abrufbar';
+    });
+  }
   try {
     const est = await navigator.storage?.estimate?.();
     if (est && $('#storage-used')) $('#storage-used').textContent = fmtBytes(est.usage || 0);
@@ -1127,41 +1217,44 @@ async function renderSettings() {
   }
 }
 
-async function changeKey() {
+async function changeKey(provider) {
+  const p = PROVIDERS[provider];
   const values = await formDialog({
-    title: 'API-Schlüssel ändern',
-    message: 'Der neue Schlüssel wird geprüft und ersetzt den bisherigen.',
-    fields: [{ name: 'key', label: 'OpenAI-API-Schlüssel', placeholder: 'sk-…', secret: true }],
+    title: `${p.name}-Schlüssel ${getKey(provider) ? 'ändern' : 'hinzufügen'}`,
+    message: `Erstellen unter ${p.keyUrl}. Der Schlüssel wird geprüft und nur auf diesem Gerät gespeichert.`,
+    fields: [{ name: 'key', label: `${p.name}-API-Schlüssel`, placeholder: p.keyHint, secret: true }],
     confirm: 'Speichern',
-    validate: async (v, msgEl, button) => saveKeyFlow(v.key, msgEl, button),
+    validate: async (v, msgEl, button) => saveKeyFlow(provider, v.key, msgEl, button),
   });
-  if (values) { toast('Schlüssel gespeichert'); renderSettings(); }
+  if (values) { toast(`${p.name}-Schlüssel gespeichert`); renderSettings(); }
 }
 
-async function testStoredKey(btn) {
+async function testStoredKey(provider, btn) {
+  const p = PROVIDERS[provider];
   const label = btn.querySelector('span');
   btn.disabled = true;
   label.textContent = 'Prüfe …';
-  const res = await api.testKey(api.getKey());
+  const res = await KEY_TESTERS[provider](getKey(provider));
   btn.disabled = false;
   label.textContent = 'Prüfen';
-  if (res.ok) toast('Schlüssel funktioniert');
-  else if (res.reason === 'invalid') alertDialog('Schlüssel ungültig', 'OpenAI lehnt den gespeicherten Schlüssel ab. Bitte einen neuen eingeben.');
-  else if (res.reason === 'network') alertDialog('Keine Verbindung', 'OpenAI ist gerade nicht erreichbar.');
-  else alertDialog('Prüfung fehlgeschlagen', `OpenAI antwortet mit Status ${res.status}.`);
+  if (res.ok) toast(`${p.name}-Schlüssel funktioniert`);
+  else if (res.reason === 'invalid') alertDialog('Schlüssel ungültig', `${p.name} lehnt den gespeicherten Schlüssel ab. Bitte einen neuen eingeben.`);
+  else if (res.reason === 'network') alertDialog('Keine Verbindung', `${p.name} ist gerade nicht erreichbar.`);
+  else alertDialog('Prüfung fehlgeschlagen', `${p.name} antwortet mit Status ${res.status}.`);
 }
 
-async function deleteKey() {
+async function deleteKey(provider) {
+  const p = PROVIDERS[provider];
   const ok = await confirmDialog({
-    title: 'Schlüssel löschen?',
-    message: 'Der API-Schlüssel wird von diesem Gerät entfernt. Aufnahmen bleiben erhalten. Ohne Schlüssel ist keine Transkription möglich.',
+    title: `${p.name}-Schlüssel löschen?`,
+    message: 'Der Schlüssel wird von diesem Gerät entfernt. Aufnahmen bleiben erhalten.',
     confirm: 'Löschen',
     destructive: true,
   });
   if (!ok) return;
-  api.clearKey();
+  clearKey(provider);
   toast('Schlüssel gelöscht');
-  go('#/');
+  if (hasAnyKey()) renderSettings(); else go('#/');
 }
 
 // =====================================================================
@@ -1257,7 +1350,7 @@ function toast(text) {
 
 // Nur lokal zum Testen: interne Objekte zugänglich machen.
 if (['localhost', '127.0.0.1'].includes(location.hostname)) {
-  window.__shz = { recorder, pipeline, db, api, state };
+  window.__shz = { recorder, pipeline, db, state, settings: { getSettings, saveSettings, setKey, clearKey } };
 }
 
 boot();

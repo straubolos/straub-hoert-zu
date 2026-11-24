@@ -1,43 +1,35 @@
-// Audio-Hilfen: Teil dekodieren und kurze Sprecher-Referenzclips als WAV (Data-URL) erzeugen.
-// Damit bleiben die Sprecher über mehrere 10-Minuten-Teile hinweg einheitlich.
+// Audio-Hilfen: Aufnahmeteil zu 16 kHz Mono dekodieren, an Sprechpausen zerlegen,
+// WAV-Stücke (für DeepSeek) und kurze Stimmproben (für OpenAI) erzeugen.
 
-const TARGET_RATE = 16000;
+export const RATE = 16000;
 
-/** Dekodiert eine Audiodatei zu einem AudioBuffer mit (möglichst) 16 kHz. */
-export async function decodeAudio(blob) {
+/** Dekodiert eine Audiodatei zu Mono-Samples mit 16 kHz. */
+export async function decodeToMono16k(blob) {
   const data = await blob.arrayBuffer();
   const Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
   let ctx;
   try {
-    ctx = new Offline(1, TARGET_RATE, TARGET_RATE);
+    ctx = new Offline(1, RATE, RATE);
   } catch {
     ctx = new Offline(1, 44100, 44100);
   }
-  return new Promise((resolve, reject) => {
+  const buffer = await new Promise((resolve, reject) => {
     const p = ctx.decodeAudioData(data, resolve, reject);
     if (p && typeof p.then === 'function') p.then(resolve, reject);
   });
-}
-
-/** Ausschnitt [start, end] in Sekunden als 16-kHz-Mono-WAV-Data-URL. */
-export function clipToWavDataUrl(buffer, start, end) {
-  const sr = buffer.sampleRate;
-  const s = Math.max(0, Math.floor(start * sr));
-  const e = Math.min(buffer.length, Math.floor(end * sr));
-  const n = Math.max(0, e - s);
-  const mono = new Float32Array(n);
-  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
-    const data = buffer.getChannelData(ch);
-    for (let i = 0; i < n; i++) mono[i] += data[s + i] / buffer.numberOfChannels;
+  const n = buffer.length;
+  let mono;
+  if (buffer.numberOfChannels === 1) {
+    mono = buffer.getChannelData(0);
+  } else {
+    mono = new Float32Array(n);
+    for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+      const d = buffer.getChannelData(ch);
+      for (let i = 0; i < n; i++) mono[i] += d[i] / buffer.numberOfChannels;
+    }
   }
-  const samples = sr === TARGET_RATE ? mono : resample(mono, sr, TARGET_RATE);
-
-  // Lautstärke behutsam angleichen (Spitze auf ca. -3 dB).
-  let peak = 0;
-  for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
-  const gain = peak > 0.01 ? Math.min(8, 0.7 / peak) : 1;
-
-  return 'data:audio/wav;base64,' + toBase64(encodeWav(samples, TARGET_RATE, gain));
+  const samples = buffer.sampleRate === RATE ? mono : resample(mono, buffer.sampleRate, RATE);
+  return { samples, sampleRate: RATE, duration: samples.length / RATE };
 }
 
 function resample(input, from, to) {
@@ -54,7 +46,51 @@ function resample(input, from, to) {
   return out;
 }
 
-function encodeWav(samples, rate, gain = 1) {
+/**
+ * Zerlegt in Abschnitte von höchstens maxSec, geschnitten an der leisesten Stelle
+ * zwischen minSec und maxSec (damit möglichst kein Wort zerschnitten wird).
+ * Gibt Sample-Grenzen zurück: [0, c1, c2, …, length].
+ */
+export function splitAtPauses(samples, { maxSec = 110, minSec = 75, rate = RATE } = {}) {
+  const cuts = [0];
+  const total = samples.length;
+  const frame = Math.floor(0.3 * rate);
+  const hop = Math.floor(0.1 * rate);
+  let pos = 0;
+  while (total - pos > maxSec * rate) {
+    const from = pos + minSec * rate;
+    const to = pos + maxSec * rate;
+    let best = to;
+    let bestE = Infinity;
+    for (let s = from; s + frame <= to; s += hop) {
+      let e = 0;
+      for (let i = s; i < s + frame; i += 4) e += samples[i] * samples[i];
+      if (e < bestE) { bestE = e; best = s + (frame >> 1); }
+    }
+    cuts.push(best);
+    pos = best;
+  }
+  cuts.push(total);
+  return cuts;
+}
+
+/** WAV (16 Bit, Mono) aus einem Sample-Bereich. */
+export function wavBlob(samples, from, to, rate = RATE) {
+  return new Blob([encodeWav(samples.subarray(from, to), rate)], { type: 'audio/wav' });
+}
+
+/** Stimmprobe [start, end] in Sekunden als WAV-Data-URL (leicht normalisiert). */
+export function clipToWavDataUrl(samples, start, end, rate = RATE) {
+  const s = Math.max(0, Math.floor(start * rate));
+  const e = Math.min(samples.length, Math.floor(end * rate));
+  const part = samples.subarray(s, e);
+  let peak = 0;
+  for (let i = 0; i < part.length; i++) peak = Math.max(peak, Math.abs(part[i]));
+  const gain = peak > 0.01 ? Math.min(8, 0.7 / peak) : 1;
+  return 'data:audio/wav;base64,' + toBase64(encodeWav(part, rate, gain));
+}
+
+export function encodeWav(samples, rate, gain = 1) {
   const buf = new ArrayBuffer(44 + samples.length * 2);
   const v = new DataView(buf);
   const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
@@ -64,7 +100,7 @@ function encodeWav(samples, rate, gain = 1) {
   str(12, 'fmt ');
   v.setUint32(16, 16, true);
   v.setUint16(20, 1, true); // PCM
-  v.setUint16(22, 1, true); // mono
+  v.setUint16(22, 1, true); // Mono
   v.setUint32(24, rate, true);
   v.setUint32(28, rate * 2, true);
   v.setUint16(32, 2, true);
