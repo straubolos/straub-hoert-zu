@@ -1,6 +1,6 @@
 // Service Worker: App-Dateien offline verfügbar machen.
 // Bei jeder Veröffentlichung VERSION erhöhen, damit Geräte die neue Fassung laden.
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 const CACHE = `shz-${VERSION}`;
 const ASSETS = [
   './',

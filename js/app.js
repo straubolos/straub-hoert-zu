@@ -19,7 +19,7 @@ import {
   normalizeSearch, speakerName, fmtBytes, isStandalone, isIOS,
 } from './util.js';
 
-export const APP_VERSION = '1.1.0';
+export const APP_VERSION = '1.1.1';
 
 const recorder = new Recorder();
 const state = {
@@ -400,6 +400,16 @@ async function renderNotices() {
           <span>In Safari auf ${icons.share} „Teilen“ tippen, dann „Zum Home-Bildschirm“.</span></div>
         <button class="icon-btn small" data-act="hide-install" aria-label="Ausblenden">${icons.close}</button>
       </div>`);
+  }
+
+  if (!getSettings().summarizer) {
+    cards.push(`
+      <a class="notice notice-link" href="#/einstellungen">
+        <span class="notice-icon">${icons.key}</span>
+        <div class="notice-body"><strong>Keine Titel und Zusammenfassungen</strong>
+          <span>Dafür fehlt in dieser App ein DeepSeek-Schlüssel. Zum Eintragen tippen.</span></div>
+        <span class="chev">${icons.chevron}</span>
+      </a>`);
   }
 
   for (const r of recs) {
